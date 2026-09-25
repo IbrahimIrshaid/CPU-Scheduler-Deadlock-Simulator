@@ -119,36 +119,41 @@ class CPUScheduler:
         return operations
     
     def detect_deadlock(self) -> List[int]:
-        """Banker's algorithm based deadlock detection"""
+        """Deadlock detection (Silberschatz, single request per blocked process).
+
+        Every live process is considered, not just the blocked ones: a process
+        that is running, ready or doing IO has no outstanding request, so it can
+        run to completion and return what it holds. Only blocked processes whose
+        request can never be satisfied, even after all of that is returned,
+        are deadlocked.
+        """
         if not self.waiting_queue:
             return []
-        
-        # Build the need matrix
+
         work = self.available_resources.copy()
-        finish = {p.pid: False for p in self.waiting_queue}
-        
+        live = [p for p in self.processes
+                if p.state not in (ProcessState.NEW, ProcessState.TERMINATED)]
+        finish = {p.pid: p.waiting_for_resource is None for p in live}
+        for p in live:
+            if finish[p.pid]:
+                for rid, count in p.allocated_resources.items():
+                    work[rid] = work.get(rid, 0) + count
+
         changed = True
         while changed:
             changed = False
             for process in self.waiting_queue:
                 if finish[process.pid]:
                     continue
-                
-                # Check if process can finish with available resources
-                if process.waiting_for_resource:
-                    rid, count = process.waiting_for_resource
-                    if work.get(rid, 0) >= count:
-                        # Process can finish
-                        finish[process.pid] = True
-                        # Release its resources
-                        for r_id, r_count in process.allocated_resources.items():
-                            work[r_id] = work.get(r_id, 0) + r_count
-                        changed = True
-        
-        # Processes that cannot finish are deadlocked
-        deadlocked = [p.pid for p in self.waiting_queue if not finish[p.pid]]
-        return deadlocked
-    
+                rid, count = process.waiting_for_resource
+                if work.get(rid, 0) >= count:
+                    finish[process.pid] = True
+                    for r_id, r_count in process.allocated_resources.items():
+                        work[r_id] = work.get(r_id, 0) + r_count
+                    changed = True
+
+        return [p.pid for p in self.waiting_queue if not finish[p.pid]]
+
     def recover_from_deadlock(self, deadlocked_pids: List[int]):
         """Terminate the lowest priority process in deadlock"""
         if not deadlocked_pids:
@@ -207,6 +212,7 @@ class CPUScheduler:
                 rid, count = process.waiting_for_resource
                 if self.request_resource(process, rid, count):
                     process.waiting_for_resource = None
+                    process.burst_progress += 1  # the REQUEST op is now satisfied
                     process.state = ProcessState.READY
                     process.time_in_ready = 0
                     self.ready_queue.append(process)
@@ -321,7 +327,10 @@ class CPUScheduler:
                         
                         next_burst = self.current_process.get_current_burst()
                         if next_burst is None:
-                            # Process terminates
+                            # Process terminates: return anything it still holds
+                            for rid, count in list(self.current_process.allocated_resources.items()):
+                                self.release_resource(self.current_process, rid, count)
+                            self.check_waiting_queue()
                             self.current_process.state = ProcessState.TERMINATED
                             self.current_process.completion_time = self.time
                             self.current_process = None
